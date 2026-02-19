@@ -1,0 +1,36 @@
+Parameter,Value,Unit
+Model,SB22 - World Finals Car.stl,
+Date,2026-02-19 10:34:34,
+Velocity,27.78,m/s
+Velocity,100.0,km/h
+Reynolds Number,1.19e+05,
+Mach Number,0.0816,
+Dynamic Pressure,472.61,Pa
+Frontal Area,0.008010,m²
+Frontal Area,80.10,cm²
+Planform Area,0.003112,m²
+,,
+FORCES,,
+Total Drag,11.9099,N
+Pressure Drag,11.7837,N
+Friction Drag,0.1262,N
+Lift,0.7720,N
+Downforce,-0.7720,N
+Side Force,-0.1411,N
+,,
+COEFFICIENTS,,
+Cd (total),3.14623,
+Cd (pressure),3.11290,
+Cd (friction),0.03334,
+Cl,0.20393,
+L/D Ratio,-0.0648,
+,,
+MOMENTS,,
+Cm (pitch),-0.18431,
+Cn (yaw),-0.16301,
+Croll,-0.02454,
+,,
+PHYSICAL,,
+Mass,0.0204,kg
+Mass,20.4,g
+Volume,135.70,cm³
