@@ -335,7 +335,14 @@ class AeroSolver:
             self.results.croll = total_moment[0] / denom
 
     def _generate_velocity_field(self, velocity_kmh: float):
-        """Generate a 3D velocity field around the body (axis-aware)."""
+        """Generate a 3D velocity field around the body using mesh-aware flow.
+
+        Uses trimesh signed-distance and closest-point queries so that
+        streamlines and particles wrap around the *actual* car geometry
+        instead of a simple ellipsoid approximation.
+        """
+        from trimesh.proximity import ProximityQuery
+
         v_ms = velocity_kmh / 3.6
         fa = self.results.flow_axis
         la = self.results.lateral_axis
@@ -347,59 +354,160 @@ class AeroSolver:
         extent = bounds_max - bounds_min
         center = (bounds_min + bounds_max) / 2
 
-        # Domain extends along flow axis
+        # --- Build the mesh in solver-space (meters) for proximity queries ---
+        solver_mesh = trimesh.Trimesh(
+            vertices=self.results.vertices,
+            faces=self.results.faces,
+            face_normals=self.results.face_normals,
+            process=False,
+        )
+        # Ensure the mesh is watertight for signed distance
+        if not solver_mesh.is_watertight:
+            solver_mesh.fill_holes()
+        proximity = ProximityQuery(solver_mesh)
+
+        # --- Domain ---
         domain_min = np.copy(bounds_min)
         domain_max = np.copy(bounds_max)
-        # Flow axis: 1.5x upstream, 3x downstream
         domain_min[fa] -= extent[fa] * 1.5
         domain_max[fa] += extent[fa] * 3.0
-        # Lateral: 1.5x each side
         domain_min[la] = center[la] - extent[la] * 1.5
         domain_max[la] = center[la] + extent[la] * 1.5
-        # Vertical: slight below, 1.5x above
         domain_min[va] -= extent[va] * 0.3
         domain_max[va] += extent[va] * 1.5
 
-        n = 35
+        n = 45  # Higher resolution for better detail
         axes = [np.linspace(domain_min[i], domain_max[i], n) for i in range(3)]
         grids = np.meshgrid(axes[0], axes[1], axes[2], indexing='ij')
         points = np.column_stack([g.ravel() for g in grids])
+        n_pts = len(points)
 
-        # Velocity components (initialize to zero)
-        vel = np.zeros((len(points), 3))
-        # Freestream: wind blows along -flow_axis
+        print(f"  ▸ Computing mesh-aware velocity field ({n}³ = {n**3} pts)...")
+
+        # --- Signed distance: negative = inside mesh ---
+        try:
+            signed_dist = trimesh.proximity.signed_distance(solver_mesh, points)
+        except Exception:
+            # Fallback: use unsigned distance + simple inside check
+            closest_pts, distances, _ = proximity.on_surface(points)
+            signed_dist = distances
+            try:
+                inside_mask_check = solver_mesh.contains(points)
+                signed_dist[inside_mask_check] *= -1
+            except Exception:
+                pass
+
+        # Closest points and face IDs on the mesh surface
+        closest_pts, abs_dist, face_ids = proximity.on_surface(points)
+
+        # Surface normals at the closest face
+        surf_normals = self.results.face_normals[face_ids]
+
+        # Characteristic length for normalization
+        char_len = extent[fa]
+
+        # --- Initialize freestream ---
+        vel = np.zeros((n_pts, 3))
         vel[:, fa] = -v_ms
 
-        # Ellipsoid body perturbation
-        body_center = center
-        body_radii = extent / 2 * 1.1
-        body_radii = np.clip(body_radii, 1e-6, None)
+        # --- Classify regions ---
+        inside = signed_dist < 0               # Inside mesh
+        near_surface = (signed_dist >= 0) & (abs_dist < char_len * 0.35)
+        wake_candidate = signed_dist >= 0       # Outside mesh
 
-        d = points - body_center
-        r_norm = np.sqrt(np.sum((d / body_radii) ** 2, axis=1))
+        # --- 1. Zero velocity inside the body ---
+        vel[inside] = 0.0
 
-        blocking = np.exp(-2.0 * (r_norm - 0.3) ** 2)
-        blocking[r_norm > 2.5] = 0
+        # --- 2. Near-surface deflection: flow wraps around actual geometry ---
+        if np.any(near_surface):
+            ns_normals = surf_normals[near_surface]
+            ns_dist = abs_dist[near_surface]
 
-        # Slow flow along flow axis near body
-        vel[:, fa] -= blocking * (-v_ms) * 0.9
+            # Smooth influence: strongest at surface, fades with distance
+            # Normalize distance by characteristic length
+            norm_dist = ns_dist / (char_len * 0.35)
+            influence = np.clip(1.0 - norm_dist, 0, 1) ** 2
 
-        # Divert flow around body (perpendicular to flow axis)
-        d_perp = np.sqrt(d[:, la] ** 2 + d[:, va] ** 2)
-        d_perp = np.clip(d_perp, 0.001, None)
-        divert = blocking * v_ms * 0.5
-        vel[:, la] += divert * (d[:, la] / d_perp) * 0.4
-        vel[:, va] += divert * (d[:, va] / d_perp) * 0.3
+            # Current velocity at these points
+            v_current = vel[near_surface].copy()
 
-        # Wake: downstream along flow axis
-        downstream = (d[:, fa] > 0) & (r_norm < 3.0)
-        wake_decay = np.exp(-0.5 * (r_norm[downstream] - 1.0))
-        vel[downstream, fa] += v_ms * 0.3 * wake_decay
+            # Project out the normal component (make flow tangential)
+            # v_tangential = v - (v · n̂) * n̂
+            v_dot_n = np.sum(v_current * ns_normals, axis=1, keepdims=True)
+            v_normal = v_dot_n * ns_normals
+            v_tangential = v_current - v_normal
 
-        # Zero inside body
-        inside = r_norm < 0.85
-        vel[inside] = 0
+            # Ensure tangential flow maintains speed
+            tang_speed = np.linalg.norm(v_tangential, axis=1, keepdims=True)
+            tang_speed = np.clip(tang_speed, 1e-6, None)
+            v_tangential = v_tangential / tang_speed * v_ms
 
+            # Push flow outward near surface to prevent penetration
+            outward_push = ns_normals * (v_ms * 0.25 * influence[:, np.newaxis])
+
+            # Blend between freestream and tangential+push based on influence
+            vel[near_surface] = (
+                v_current * (1.0 - influence[:, np.newaxis]) +
+                (v_tangential + outward_push) * influence[:, np.newaxis]
+            )
+
+        # --- 3. Wake region: downstream of the actual body ---
+        # Detect wake by checking if a point is downstream AND the flow-axis
+        # coordinate is past the body's trailing edge
+        trailing_edge = bounds_max[fa] if vel[0, fa] < 0 else bounds_min[fa]
+        # Flow goes in -fa direction, so downstream means coord < trailing_edge
+        # Actually: wind blows -fa, so point with coord < body_min[fa] is downstream
+        body_min_fa = bounds_min[fa]
+
+        d_from_center = points - center
+        is_downstream = (
+            (points[:, fa] < body_min_fa) &      # Past trailing edge
+            (~inside) &
+            (abs_dist < char_len * 1.5)           # Close enough to feel wake
+        )
+
+        if np.any(is_downstream):
+            # Distance downstream from trailing edge
+            downstream_dist = body_min_fa - points[is_downstream, fa]
+            # Lateral distance from centerline
+            lat_dist = np.sqrt(
+                (points[is_downstream, la] - center[la]) ** 2 +
+                (points[is_downstream, va] - center[va]) ** 2
+            )
+            # Wake width grows with downstream distance
+            wake_width = extent[la] * 0.4 + downstream_dist * 0.3
+            in_wake_core = lat_dist < wake_width
+
+            # Velocity deficit in wake
+            wake_factor = np.exp(-downstream_dist / (char_len * 1.5))
+            wake_factor[~in_wake_core] *= 0.3  # Weaker outside core
+
+            vel[is_downstream, fa] += v_ms * 0.4 * wake_factor  # Reduce speed
+            # Add lateral spreading
+            lat_dir = np.zeros((np.sum(is_downstream), 3))
+            lat_dir[:, la] = points[is_downstream, la] - center[la]
+            lat_dir[:, va] = points[is_downstream, va] - center[va]
+            lat_mag = np.linalg.norm(lat_dir, axis=1, keepdims=True)
+            lat_mag = np.clip(lat_mag, 1e-6, None)
+            lat_dir = lat_dir / lat_mag
+            vel[is_downstream] += lat_dir * (v_ms * 0.08 * wake_factor[:, np.newaxis])
+
+        # --- 4. Acceleration around the body (Venturi effect at sides/top) ---
+        side_accel = (
+            near_surface &
+            ~inside &
+            (np.abs(surf_normals[:, la]) > 0.5) | (np.abs(surf_normals[:, va]) > 0.5)
+        )
+        if np.any(side_accel):
+            # Speed up tangential flow near curved surfaces
+            sa_dist = abs_dist[side_accel]
+            sa_influence = np.clip(1.0 - sa_dist / (char_len * 0.2), 0, 1)
+            speed = np.linalg.norm(vel[side_accel], axis=1, keepdims=True)
+            speed = np.clip(speed, 1e-6, None)
+            vel_dir = vel[side_accel] / speed
+            vel[side_accel] += vel_dir * (v_ms * 0.2 * sa_influence[:, np.newaxis])
+
+        # --- Store results ---
         self.results.vel_field_points = points.reshape(n, n, n, 3)
         self.results.vel_field_vectors = vel.reshape(n, n, n, 3)
 
@@ -409,7 +517,10 @@ class AeroSolver:
         )
         self.results._vel_grid_dims = (n, n, n)
 
-        print(f"  ▸ Velocity field: {n}³ = {n**3} points generated")
+        # Store mesh reference for visualizer particle collision
+        self.results._solver_mesh = solver_mesh
+
+        print(f"  ▸ Velocity field: {n}³ = {n**3} mesh-aware points generated")
 
     def _run_speed_sweep(self):
         """Run analysis at multiple speeds for comparative data."""

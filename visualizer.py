@@ -212,7 +212,10 @@ class WindTunnelVisualizer:
             self._add_fallback_streamlines(plotter)
 
     def _add_fallback_streamlines(self, plotter):
-        """Add dense line-based streamlines as fallback (axis-aware, more sheets)."""
+        """Add mesh-aware line-based streamlines (deflected by actual geometry)."""
+        import trimesh as _trimesh
+        from trimesh.proximity import ProximityQuery
+
         r = self.results
         fa = r.flow_axis
         la = r.lateral_axis
@@ -224,16 +227,22 @@ class WindTunnelVisualizer:
         center = (bmin + bmax) / 2
         ext = bmax - bmin
 
+        # Build / reuse solver mesh for proximity queries
+        solver_mesh = getattr(r, '_solver_mesh', None)
+        if solver_mesh is None:
+            solver_mesh = _trimesh.Trimesh(
+                vertices=r.vertices, faces=r.faces, process=False)
+        proximity = ProximityQuery(solver_mesh)
+
         # Dense stream sheets: 18 lateral x 12 vertical
         n_la = 18
         n_va = 12
         la_pts = np.linspace(center[la] - ext[la] * 0.8, center[la] + ext[la] * 0.8, n_la)
         va_pts = np.linspace(bmin[va] + ext[va] * 0.05, bmin[va] + ext[va] * 1.3, n_va)
 
-        # Flow goes from +fa to -fa (upstream to downstream)
         start_fa = bmin[fa] - ext[fa] * 1.5
         end_fa = bmax[fa] + ext[fa] * 3.0
-        n_pts = 80  # Points per streamline
+        n_pts = 100  # More points for smoother deflection
 
         for l_val in la_pts:
             for v_val in va_pts:
@@ -242,39 +251,59 @@ class WindTunnelVisualizer:
                 pts[:, la] = l_val
                 pts[:, va] = v_val
 
-                # Check if this line intersects the body
-                hit_la = (l_val > bmin[la]) and (l_val < bmax[la])
-                hit_va = (v_val > bmin[va]) and (v_val < bmax[va])
+                # Query distance to mesh for all points on this line
+                closest, dists, fids = proximity.on_surface(pts)
+                surf_n = r.face_normals[fids] if r.face_normals is not None else np.zeros_like(pts)
 
-                if hit_la and hit_va:
-                    # Turbulent — add deflection around the body
-                    noise_la = np.random.normal(0, ext[la] * 0.04, size=n_pts)
-                    noise_va = np.random.normal(0, ext[va] * 0.03, size=n_pts)
-                    body_region = (pts[:, fa] > bmin[fa] - ext[fa]*0.2) & (pts[:, fa] < bmax[fa] + ext[fa]*0.5)
-                    noise_la[body_region] *= 3.0
-                    noise_va[body_region] *= 2.5
-                    pts[:, la] += noise_la
-                    pts[:, va] += noise_va
-                    
-                    # Simulated velocity drop near body
-                    dist_to_center = np.sqrt(((pts[:, la]-center[la])/ext[la])**2 + ((pts[:, va]-center[va])/ext[va])**2)
-                    speed_factor = np.clip(dist_to_center * 1.5, 0.3, 1.1)
+                # Deflect points near the mesh surface
+                deflection_radius = max(ext[la], ext[va]) * 0.5
+                near = dists < deflection_radius
+
+                if np.any(near):
+                    # Influence: stronger closer to surface
+                    influence = np.clip(1.0 - dists[near] / deflection_radius, 0, 1) ** 1.5
+
+                    # Push point outward along surface normal
+                    push = surf_n[near] * (deflection_radius * influence[:, np.newaxis] * 0.6)
+                    pts[near] += push
+
+                    # Speed reduction near surface
+                    speed_factor_near = 0.3 + 0.7 * (1.0 - influence)
                 else:
-                    speed_factor = np.ones(n_pts) * 1.0
+                    speed_factor_near = np.array([])
 
-                # Color by simulated speed
-                speed = r.velocity_ms * speed_factor
-                
-                line = pv.Spline(pts, n_pts)
-                line["Speed"] = speed
-                plotter.add_mesh(
-                    line, scalars="Speed", cmap="turbo", 
-                    clim=[0, r.velocity_ms*1.2],
-                    opacity=0.6, line_width=2.0, show_scalar_bar=False,
-                    render_lines_as_tubes=True
-                )
+                # Build speed array
+                speed = np.ones(n_pts) * r.velocity_ms
+                if np.any(near):
+                    speed[near] = r.velocity_ms * speed_factor_near
 
-        print(f"  \u25b8 Fallback streamlines: {n_la}x{n_va} = {n_la*n_va} lines (colored)")
+                    # Wake: points downstream of body get slower
+                    downstream_mask = pts[:, fa] < bmin[fa]
+                    if np.any(downstream_mask):
+                        down_dist = bmin[fa] - pts[downstream_mask, fa]
+                        lat_d = np.sqrt(
+                            (pts[downstream_mask, la] - center[la])**2 +
+                            (pts[downstream_mask, va] - center[va])**2
+                        )
+                        wake_w = ext[la] * 0.4 + down_dist * 0.2
+                        in_wake = lat_d < wake_w
+                        wake_slow = np.exp(-down_dist / (ext[fa] * 1.5))
+                        wake_slow[~in_wake] *= 0.3
+                        speed[downstream_mask] *= (1.0 - 0.4 * wake_slow)
+
+                try:
+                    line = pv.Spline(pts, n_pts)
+                    line["Speed"] = speed
+                    plotter.add_mesh(
+                        line, scalars="Speed", cmap="turbo",
+                        clim=[0, r.velocity_ms * 1.2],
+                        opacity=0.6, line_width=2.0, show_scalar_bar=False,
+                        render_lines_as_tubes=True
+                    )
+                except Exception:
+                    pass  # Skip degenerate splines
+
+        print(f"  \u25b8 Mesh-aware fallback streamlines: {n_la}x{n_va} = {n_la*n_va} lines")
 
     def _add_force_arrows(self, plotter):
         """Add drag and lift force vectors on the model (axis-aware)."""
@@ -542,9 +571,12 @@ class WindTunnelVisualizer:
         p.show()
 
     def show_realtime(self, export_dir: Path = None):
-        """Show real-time animated particles flowing around the car."""
+        """Show real-time animated particles flowing around the car (mesh-aware)."""
         import time
-        print("\n[VIZ] Rendering REAL-TIME animated particle flow...")
+        import trimesh as _trimesh
+        from trimesh.proximity import ProximityQuery
+
+        print("\n[VIZ] Rendering REAL-TIME mesh-aware particle flow...")
         self._build_pyvista_mesh()
         grid = self._build_velocity_grid()
         cfg = self.config.viz
@@ -572,10 +604,17 @@ class WindTunnelVisualizer:
         self._add_hud(p)
 
         p.add_text(
-            "▶ REAL-TIME PARTICLE ANIMATION",
+            "▶ REAL-TIME PARTICLE ANIMATION (MESH-AWARE)",
             position="lower_left", font_size=10,
             color="#00ff88", font="courier", shadow=True,
         )
+
+        # --- Build / reuse solver mesh for proximity queries ---
+        solver_mesh = getattr(r, '_solver_mesh', None)
+        if solver_mesh is None:
+            solver_mesh = _trimesh.Trimesh(
+                vertices=r.vertices, faces=r.faces, process=False)
+        proximity = ProximityQuery(solver_mesh)
 
         # Prepare particle system
         bounds = self.pv_mesh.bounds
@@ -583,153 +622,143 @@ class WindTunnelVisualizer:
         bmax = np.array([bounds[1], bounds[3], bounds[5]])
         ext = bmax - bmin
         center = (bmin + bmax) / 2
+        char_len = ext[fa]
 
-        # Particle parameters - SimScale style: Lots of particles, streak effect
         n_particles = 2000
         v_ms = r.velocity_ms
-        dt = ext[fa] * 0.02
-        
-        # Geometry for streaks
-        streak_scale = ext[fa] * 0.04
+        dt = ext[fa] * 0.015
 
-        # Initialize particle positions
+        # Spawn upstream of body
         def spawn_particles(n):
             pts = np.zeros((n, 3))
-            # Spread widely upstream
-            pts[:, fa] = bmin[fa] - ext[fa] * np.random.uniform(0.5, 2.5, n)
+            pts[:, fa] = bmax[fa] + ext[fa] * np.random.uniform(0.5, 2.5, n)
             pts[:, la] = center[la] + ext[la] * np.random.uniform(-1.2, 1.2, n)
             pts[:, va] = bmin[va] + ext[va] * np.random.uniform(-0.2, 1.6, n)
             return pts
 
         particles = spawn_particles(n_particles)
         velocities = np.zeros_like(particles)
-        
+
         # Create polydata for particles
         particle_cloud = pv.PolyData(particles)
         particle_cloud["Velocity Magnitude"] = np.zeros(n_particles)
-        particle_cloud["vectors"] = velocities # For orientation
 
-        # Use arrow/streak glyphs for motion blur effect
-        # We use a simple line or elongated sphere as the glyph
-        glyph_source = pv.Line(pointa=(-0.5, 0, 0), pointb=(0.5, 0, 0))
-        
-        # Initial add
         actor = p.add_mesh(
-            particle_cloud, 
+            particle_cloud,
             scalars="Velocity Magnitude",
             cmap="turbo",
             clim=[0, v_ms * 1.3],
             show_scalar_bar=True,
-            scalar_bar_args={"title": "Flow Speed (m/s)", "color": "white", "width": 0.08, "position_x": 0.85},
-            render_points_as_spheres=True, # Fallback
+            scalar_bar_args={"title": "Flow Speed (m/s)", "color": "white",
+                             "width": 0.08, "position_x": 0.85},
+            render_points_as_spheres=True,
             point_size=6,
             opacity=0.8
         )
 
-        body_center = center
-        body_radii = ext / 2 * 1.05
-        body_radii = np.clip(body_radii, 1e-6, None)
-
         # Set camera
         p.camera_position = self._get_iso_camera()
         p.enable_anti_aliasing("ssaa")
-        
-        # Pre-calculate random turbulence
-        turb_la_base = np.random.normal(0, 1, (10000, n_particles)) * 0.0
-        turb_idx = 0
 
-        # Animation callback
+        # Pre-compute face normals reference
+        mesh_normals = r.face_normals if r.face_normals is not None else solver_mesh.face_normals
+
+        # Animation callback — mesh-aware physics
         def update_particles(caller, event):
-            nonlocal particles, velocities, turb_idx
-            turb_idx += 1
-            
-            d = particles - body_center
-            
-            # vectorized distance check
-            # Ellipsoid distance approximation
-            # We normalize coordinate system to sphere
-            d_norm = d / body_radii
-            r_sq = np.sum(d_norm**2, axis=1)
-            r_dist = np.sqrt(r_sq)
-            
-            # --- Vectorized Physics ---
-            
-            # 1. Base flow
+            nonlocal particles, velocities
+
+            # --- 1. Query distance to actual mesh surface ---
+            closest_pts, dists, face_ids = proximity.on_surface(particles)
+            surf_normals = mesh_normals[face_ids]
+
+            # --- 2. Detect inside / near / far ---
+            # Check inside using signed distance (or contains)
+            try:
+                inside = solver_mesh.contains(particles)
+            except Exception:
+                inside = dists < char_len * 0.005  # fallback: very close = inside
+
+            near_threshold = char_len * 0.3
+            near = (~inside) & (dists < near_threshold)
+
+            # --- 3. Base freestream velocity ---
             vel_target = np.zeros_like(particles)
             vel_target[:, fa] = -v_ms
 
-            # 2. Obstacle Avoidance (Potential Flow approximation)
-            # Influence factor: 1.0 at surface, decaying
-            influence = np.exp(-1.5 * (r_dist - 0.5)**2)
-            influence[r_dist > 3.0] = 0
-            
-            # Radial push vector (normal to ellipsoid surface)
-            push_dir = d_norm / (r_dist[:, np.newaxis] + 1e-6)
-            
-            # Blend: flow diverts around
-            # Tangential component preservation is hard in simple math, 
-            # so we just add the push component and reduce axial flow
-            
-            # Slow down axial flow near nose/tail
-            # High pressure zone at nose
-            nose_region = (d_norm[:, fa] > 0.8) & (r_dist < 1.5)
-            vel_target[nose_region, fa] *= 0.2
-            
-            # Add radial diversion
-            divert_strength = v_ms * influence * 1.2
-            vel_target += push_dir * divert_strength[:, np.newaxis]
-            
-            # Wake turbulence (downstream)
-            # Downstream is where d_norm[fa] > 0 (since flow comes from +fa) — wait, flow is -fa
-            # Correction: flow comes from +fa, moves to -fa.
-            # So downstream is where coord is LESS than body (more negative)
-            # Upstream = positive fa relative to center
-            # Downstream = negative fa relative to center
-            
-            # My coordinate system assumption in solver was: Wind blows along -flow_axis.
-            # So particles move in -data[fa].
-            # Downstream is coordinates < body_center[fa]
-            
-            # Let's verify assumption:
-            # Solver: vel[:, fa] = -v_ms. Correct.
-            # So downstream is local coord < 0.
-            
-            is_downstream = (d_norm[:, fa] < -0.8) & (np.sqrt(d_norm[:, la]**2 + d_norm[:, va]**2) < 1.0)
-            
-            # Add turbulence in wake
-            rows = particles.shape[0]
-            if np.any(is_downstream):
-                # Simple random jitter
-                jitter = np.random.normal(0, v_ms*0.3, (np.sum(is_downstream), 3))
-                vel_target[is_downstream] += jitter
+            # --- 4. Near-surface: deflect flow tangentially ---
+            if np.any(near):
+                ns_normals = surf_normals[near]
+                ns_dist = dists[near]
 
-            # 3. Apply
+                # Influence: strongest at surface
+                influence = np.clip(1.0 - ns_dist / near_threshold, 0, 1) ** 2
+
+                v_curr = vel_target[near].copy()
+
+                # Project out normal component → tangential flow
+                v_dot_n = np.sum(v_curr * ns_normals, axis=1, keepdims=True)
+                v_tangential = v_curr - v_dot_n * ns_normals
+
+                # Maintain speed
+                tang_speed = np.linalg.norm(v_tangential, axis=1, keepdims=True)
+                tang_speed = np.clip(tang_speed, 1e-6, None)
+                v_tangential = v_tangential / tang_speed * v_ms
+
+                # Outward push to prevent penetration
+                outward = ns_normals * (v_ms * 0.3 * influence[:, np.newaxis])
+
+                # Blend
+                vel_target[near] = (
+                    v_curr * (1.0 - influence[:, np.newaxis]) +
+                    (v_tangential + outward) * influence[:, np.newaxis]
+                )
+
+            # --- 5. Wake turbulence (downstream of body) ---
+            d_from_center = particles - center
+            body_min_fa = bmin[fa]
+            is_downstream = (
+                (particles[:, fa] < body_min_fa) &
+                (~inside) &
+                (dists < char_len * 1.5)
+            )
+            if np.any(is_downstream):
+                down_dist = body_min_fa - particles[is_downstream, fa]
+                lat_d = np.sqrt(
+                    (particles[is_downstream, la] - center[la]) ** 2 +
+                    (particles[is_downstream, va] - center[va]) ** 2
+                )
+                wake_w = ext[la] * 0.4 + down_dist * 0.2
+                in_wake = lat_d < wake_w
+                wake_f = np.exp(-down_dist / (char_len * 1.5))
+                wake_f[~in_wake] *= 0.3
+
+                # Slow down + turbulence
+                vel_target[is_downstream, fa] += v_ms * 0.35 * wake_f
+                jitter = np.random.normal(0, v_ms * 0.15, (np.sum(is_downstream), 3))
+                jitter[:, fa] *= 0.5  # Less axial jitter
+                vel_target[is_downstream] += jitter * wake_f[:, np.newaxis]
+
+            # --- 6. Apply velocity ---
             velocities = vel_target
             particles += velocities * dt
 
-            # 4. Respawn
-            # Out bounds check (too far negative along fa)
-            # bmin is min value. flow goes to -inf.
-            # So if p[fa] < bmin[fa] - margin -> respawn
-            out_mask = (particles[:, fa] < bmin[fa] - ext[fa]*1.0) | \
-                       (particles[:, la] < center[la] - ext[la]*2.0) | \
-                       (particles[:, la] > center[la] + ext[la]*2.0) | \
-                       (particles[:, va] < bmin[va] - ext[va]*0.5) | \
-                       (particles[:, va] > bmax[va] + ext[va]*2.0)
-                       
-            # Also respawn if inside body
-            inside_mask = r_dist < 0.8
-            respawn_mask = out_mask | inside_mask
-            
+            # --- 7. Respawn: out of bounds or inside mesh ---
+            out_mask = (
+                (particles[:, fa] < bmin[fa] - ext[fa] * 1.5) |
+                (particles[:, la] < center[la] - ext[la] * 2.0) |
+                (particles[:, la] > center[la] + ext[la] * 2.0) |
+                (particles[:, va] < bmin[va] - ext[va] * 0.5) |
+                (particles[:, va] > bmax[va] + ext[va] * 2.0)
+            )
+            respawn_mask = out_mask | inside
+
             n_respawn = np.sum(respawn_mask)
             if n_respawn > 0:
                 particles[respawn_mask] = spawn_particles(n_respawn)
-                velocities[respawn_mask] = 0 # reset vel
+                velocities[respawn_mask] = 0
 
-            # 5. Update PolyData
+            # --- 8. Update PolyData ---
             particle_cloud.points = particles
-            
-            # Update scalars for color
             speed = np.linalg.norm(velocities, axis=1)
             particle_cloud["Velocity Magnitude"] = speed
 
@@ -740,13 +769,13 @@ class WindTunnelVisualizer:
 
         # Animation loop
         p.show(interactive_update=True)
-        
+
         while True:
             try:
                 update_particles(None, None)
                 p.update()
             except AttributeError:
-                break # Window closed
+                break  # Window closed
             except Exception:
                 break
 
